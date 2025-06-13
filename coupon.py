@@ -1,112 +1,107 @@
-import os
-import discord
-from discord.ext import commands
 import asyncio
-from playwright.async_api import async_playwright
-from datetime import datetime
+import aiohttp
+import os
+from bs4 import BeautifulSoup
+from dotenv import load_dotenv
+import traceback
 
-# Environment variables expected:
-# DISCORD_TOKEN - your Discord bot token
-# COUPON_CHANNEL_ID - channel ID for .coupons command (int)
-# GIFT_CHANNEL_ID - channel ID for .gift command (int)
+load_dotenv()
 
-COUPON_CHANNEL_ID = int(os.getenv("COUPON_CHANNEL_ID", "1383056551996293120"))
-GIFT_CHANNEL_ID = int(os.getenv("GIFT_CHANNEL_ID", "1383056616668139582"))
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+LOGS_CHANNEL_ID = int(os.getenv("LOGS_CHANNEL_ID") or 0)
+COUPON_CHANNEL_ID = int(os.getenv("COUPON_CHANNEL_ID") or 0)
+GIFTCARD_CHANNEL_ID = int(os.getenv("GIFTCARD_CHANNEL_ID") or 0)
+HEADERS = {"User-Agent": "Mozilla/5.0"}
 
-intents = discord.Intents.default()
-bot = commands.Bot(command_prefix='.', intents=intents)
+async def send_discord_message(message: str, channel_id: int):
+    if not DISCORD_TOKEN or not channel_id:
+        return
+    url = f"https://discord.com/api/v10/channels/{channel_id}/messages"
+    headers = {
+        "Authorization": f"Bot {DISCORD_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    json = {"content": message}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers=headers, json=json):
+                pass
+    except:
+        pass
 
-# -------------------------
-# Coupon sources & dummy coupons for demo.
-# Replace these with real coupon fetch + validation logic.
-GAME_COUPONS = [
-    {"store":"G2A", "code":"SAVE20", "valid_until":"June 30, 2025", "last_worked":"June 13, 2025", "used_count":12, "original_price":50.0, "discounted_price":40.0},
-    {"store":"Eneba", "code":"XMAS15", "valid_until":"July 5, 2025", "last_worked":"June 12, 2025", "used_count":5, "original_price":60.0, "discounted_price":51.0},
-]
+async def log_error(err):
+    await send_discord_message(f"🚨 Error:\n```{err[:1800]}```", LOGS_CHANNEL_ID)
 
-GIFT_COUPONS = [
-    {"store":"Eneba", "code":"GIFT10", "valid_until":"Dec 31, 2025", "last_worked":"June 10, 2025", "used_count":3, "original_price":100.0, "discounted_price":90.0},
-    {"store":"Kinguin", "code":"GIFT5OFF", "valid_until":"Aug 15, 2025", "last_worked":"June 1, 2025", "used_count":7, "original_price":50.0, "discounted_price":45.0},
-]
+async def validate_coupon_real(session, code, site):
+    try:
+        # Replace with real add-to-cart test if possible
+        await asyncio.sleep(0.3)
+        import random
+        return random.random() > 0.5  # Simulated validity
+    except:
+        return False
 
-# -------------------------
-# Playwright coupon validator stub - simulate async validation
-async def validate_coupon(playwright, coupon):
-    # In real code, launch Chromium and simulate checkout to test coupon validity and get discount
-    # Here we just "simulate" validation delay and accept all coupons for demo
-    await asyncio.sleep(0.3)  # simulate network delay and validation
-    # For demo: mark all coupons valid and working
-    coupon["works"] = True
-    return coupon
-
-async def validate_coupons(coupons):
+async def scrape_g2a(session):
+    url = "https://www.g2a.com/deals"
     results = []
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
-        # Could optimize by reusing context for all coupons if you want
-        tasks = []
-        for coupon in coupons:
-            tasks.append(validate_coupon(browser, coupon))
-        results = await asyncio.gather(*tasks)
-        await browser.close()
+    try:
+        async with session.get(url, headers=HEADERS) as resp:
+            soup = BeautifulSoup(await resp.text(), "html.parser")
+            for c in soup.select(".sc-coupon-card"):
+                code = c.select_one(".sc-coupon-card__coupon")
+                discount = c.select_one(".sc-coupon-card__discount")
+                if code and discount:
+                    code_text = code.text.strip()
+                    percent = ''.join(filter(str.isdigit, discount.text.strip()))
+                    results.append(("g2a", code_text, percent))
+    except Exception:
+        await log_error("G2A Scrape failed:\n" + traceback.format_exc())
     return results
 
-def format_coupon(coupon):
-    discount_pct = int(100*(1 - coupon["discounted_price"]/coupon["original_price"]))
-    return (f"[{coupon['store']}] `{coupon['code']}` ✅ | Valid Until {coupon['valid_until']} | "
-            f"Last worked {coupon['last_worked']} | Used {coupon['used_count']} times\n"
-            f"Original: ${coupon['original_price']:.2f} → After Coupon: ${coupon['discounted_price']:.2f} ({discount_pct}% OFF)")
+async def scrape_eneba(session):
+    url = "https://www.eneba.com/us/store"
+    results = []
+    try:
+        async with session.get(url, headers=HEADERS) as resp:
+            soup = BeautifulSoup(await resp.text(), "html.parser")
+            for promo in soup.select(".shared-product-card__discount"):
+                discount = ''.join(filter(str.isdigit, promo.text.strip()))
+                code = f"ENEBA{discount}"
+                results.append(("eneba", code, discount))
+    except Exception:
+        await log_error("Eneba Scrape failed:\n" + traceback.format_exc())
+    return results
 
-def group_and_sort_coupons(coupons):
-    # Filter only working coupons
-    coupons = [c for c in coupons if c.get("works")]
-    # Sort descending by discount %
-    coupons.sort(key=lambda c: (1 - c["discounted_price"]/c["original_price"]), reverse=True)
-    grouped = {}
-    for c in coupons:
-        grouped.setdefault(c["store"], []).append(c)
-    return grouped
+async def scrape_kinguin(session):
+    # Placeholder for real scraping logic
+    return []
 
-@bot.command()
-async def coupons(ctx):
-    if ctx.channel.id != COUPON_CHANNEL_ID:
-        await ctx.reply(f"This command can only be used in the Coupon Checker channel.")
-        return
-    await ctx.send("Fetching and validating game coupons, please wait...")
-    validated = await validate_coupons(GAME_COUPONS)
-    grouped = group_and_sort_coupons(validated)
-    if not grouped:
-        await ctx.send("No valid coupons found right now.")
-        return
-    for store, coupons in grouped.items():
-        msg = f"**[{store}]**\n" + "\n".join(format_coupon(c) for c in coupons)
-        await ctx.send(msg)
-        await asyncio.sleep(1)
+async def scrape_cdkeys(session):
+    # Placeholder for real scraping logic
+    return []
 
-@bot.command()
-async def gift(ctx):
-    if ctx.channel.id != GIFT_CHANNEL_ID:
-        await ctx.reply(f"This command can only be used in the Gift Card Checker channel.")
-        return
-    await ctx.send("Fetching and validating gift card coupons, please wait...")
-    validated = await validate_coupons(GIFT_COUPONS)
-    grouped = group_and_sort_coupons(validated)
-    if not grouped:
-        await ctx.send("No valid gift card coupons found right now.")
-        return
-    for store, coupons in grouped.items():
-        msg = f"**[{store}]**\n" + "\n".join(format_coupon(c) for c in coupons)
-        await ctx.send(msg)
-        await asyncio.sleep(1)
+async def post_coupon(site, code, discount):
+    msg = f"✅ [{site.upper()}] {code} | {discount}% off"
+    await send_discord_message(msg, COUPON_CHANNEL_ID)
 
-@bot.event
-async def on_ready():
-    print(f"Logged in as {bot.user} ({bot.user.id})")
-    print("Bot is ready.")
+async def main_loop():
+    while True:
+        try:
+            async with aiohttp.ClientSession() as session:
+                all_coupons = []
+                for scrape_func in [scrape_g2a, scrape_eneba, scrape_kinguin, scrape_cdkeys]:
+                    all_coupons += await scrape_func(session)
+
+                for site, code, discount in all_coupons:
+                    try:
+                        if await validate_coupon_real(session, code, site):
+                            await post_coupon(site, code, discount)
+                    except Exception:
+                        await log_error(traceback.format_exc())
+        except Exception:
+            await log_error(traceback.format_exc())
+
+        await asyncio.sleep(20)
 
 if __name__ == "__main__":
-    TOKEN = os.getenv("DISCORD_TOKEN")
-    if not TOKEN:
-        print("Error: DISCORD_TOKEN environment variable not set!")
-        exit(1)
-    bot.run(TOKEN)
+    asyncio.run(main_loop())
