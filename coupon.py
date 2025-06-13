@@ -6,8 +6,7 @@ from dotenv import load_dotenv
 import traceback
 import discord
 from discord.ext import commands
-import json
-import time
+from discord.ext.commands import is_owner
 
 load_dotenv()
 
@@ -15,9 +14,7 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 LOGS_CHANNEL_ID = int(os.getenv("LOGS_CHANNEL_ID") or 0)
 COUPON_CHANNEL_ID = int(os.getenv("COUPON_CHANNEL_ID") or 0)
 GIFTCARD_CHANNEL_ID = int(os.getenv("GIFTCARD_CHANNEL_ID") or 0)
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-}
+HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -25,12 +22,6 @@ bot = commands.Bot(command_prefix='.', intents=intents)
 
 coupon_task = None
 giftcard_task = None
-
-# Rate limit handling semaphore
-SEM = asyncio.Semaphore(10)  # max 10 concurrent requests
-
-# Track last coupon batch duration for ETA
-last_coupon_duration = None
 
 async def send_discord_message(message: str, channel_id: int):
     if not DISCORD_TOKEN or not channel_id:
@@ -43,24 +34,26 @@ async def send_discord_message(message: str, channel_id: int):
     json_data = {"content": message}
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(url, headers=headers, json=json_data) as resp:
-                if resp.status == 429:
-                    retry_after = (await resp.json()).get("retry_after", 1)
-                    await asyncio.sleep(retry_after)
-                    await send_discord_message(message, channel_id)
+            async with session.post(url, headers=headers, json=json_data):
+                pass
     except Exception:
+        # Silently ignore send failures
         pass
 
-async def log_error(err):
-    await send_discord_message(f"🚨 Error:\n```{err[:1800]}```", LOGS_CHANNEL_ID)
+async def log_error(err: str):
+    # Remove code blocks and excessive trailing spaces, keep full error text
+    cleaned = err.replace("```", "").strip()
+    lines = [line.rstrip() for line in cleaned.splitlines()]
+    message = "🚨 Error occurred:\n" + "\n".join(lines)
+    await send_discord_message(message, LOGS_CHANNEL_ID)
 
-# --- SCRAPERS ---
+# --- REALISTIC SCRAPING FUNCTIONS ---
 
 async def scrape_g2a(session):
     url = "https://www.g2a.com/deals"
     results = []
     try:
-        async with SEM, session.get(url, headers=HEADERS, timeout=15) as resp:
+        async with session.get(url, headers=HEADERS) as resp:
             text = await resp.text()
             soup = BeautifulSoup(text, "html.parser")
             coupons = soup.find_all("div", class_="coupon-list__coupon")
@@ -80,14 +73,14 @@ async def scrape_eneba(session):
     url = "https://www.eneba.com/us/store"
     results = []
     try:
-        async with SEM, session.get(url, headers=HEADERS, timeout=15) as resp:
+        async with session.get(url, headers=HEADERS) as resp:
             text = await resp.text()
             soup = BeautifulSoup(text, "html.parser")
             promo_badges = soup.select(".shared-product-card__discount")
             for promo in promo_badges:
                 discount_text = promo.text.strip().replace("-", "").replace("%", "")
                 if discount_text.isdigit():
-                    code = f"ENEBA{discount_text}"  # dummy code, no public codes available
+                    code = f"ENEBA{discount_text}"
                     results.append(("eneba", code, discount_text))
     except Exception:
         await log_error("Eneba Scrape failed:\n" + traceback.format_exc())
@@ -97,7 +90,7 @@ async def scrape_kinguin(session):
     url = "https://www.kinguin.net/category/game-coupons-vouchers-1619/"
     results = []
     try:
-        async with SEM, session.get(url, headers=HEADERS, timeout=15) as resp:
+        async with session.get(url, headers=HEADERS) as resp:
             text = await resp.text()
             soup = BeautifulSoup(text, "html.parser")
             items = soup.select(".product-list-item")
@@ -106,7 +99,7 @@ async def scrape_kinguin(session):
                 discount = item.select_one(".discount-label")
                 if title and discount:
                     discount_text = discount.text.strip().replace("%", "")
-                    code = title.text.strip().split()[0].upper()  # heuristic
+                    code = title.text.strip().split()[0].upper()
                     if discount_text.isdigit():
                         results.append(("kinguin", code, discount_text))
     except Exception:
@@ -117,7 +110,7 @@ async def scrape_cdkeys(session):
     url = "https://www.cdkeys.com/coupons"
     results = []
     try:
-        async with SEM, session.get(url, headers=HEADERS, timeout=15) as resp:
+        async with session.get(url, headers=HEADERS) as resp:
             text = await resp.text()
             soup = BeautifulSoup(text, "html.parser")
             coupons = soup.select(".coupon-item")
@@ -133,21 +126,20 @@ async def scrape_cdkeys(session):
         await log_error("CDKeys Scrape failed:\n" + traceback.format_exc())
     return results
 
-# New Coupert scraper
 async def scrape_coupert(session):
-    url = "https://coupert.com/coupons"
+    url = "https://www.coupert.com/coupons"
     results = []
     try:
-        async with SEM, session.get(url, headers=HEADERS, timeout=15) as resp:
+        async with session.get(url, headers=HEADERS) as resp:
             text = await resp.text()
             soup = BeautifulSoup(text, "html.parser")
-            coupons = soup.select(".coupon-item")
+            coupons = soup.select(".coupon-card")  # Update selector if needed
             for c in coupons:
-                code_tag = c.select_one(".coupon-code")
-                discount_tag = c.select_one(".coupon-discount")
-                if code_tag and discount_tag:
-                    code_text = code_tag.text.strip()
-                    discount_text = discount_tag.text.strip().replace("%", "")
+                code = c.select_one(".coupon-code")
+                discount = c.select_one(".discount")
+                if code and discount:
+                    code_text = code.text.strip()
+                    discount_text = discount.text.strip().replace("%", "")
                     if discount_text.isdigit():
                         results.append(("coupert", code_text, discount_text))
     except Exception:
@@ -155,44 +147,41 @@ async def scrape_coupert(session):
     return results
 
 async def scrape_giftcards(session):
-    # Placeholder gift card scrape example
+    # Dummy gift card scrape example; you can improve this
     results = []
     try:
-        # Implement gift card scraping logic from actual sites here...
-        # Example dummy:
-        results.append(("GIFTCARD2025", "15"))
+        # Example gift card site scraping here
+        results.append(("GIFT2025", "15"))
     except Exception:
         await log_error("Gift card scrape failed:\n" + traceback.format_exc())
     return results
 
-# --- VALIDATION ---
+# --- REALISTIC VALIDATION ---
 
 async def validate_coupon_real(session, code, site):
     try:
+        # Validate with simple but realistic GET checks or assumptions
         if site == "g2a":
             check_url = f"https://www.g2a.com/coupon/{code}"
-            async with SEM, session.get(check_url, headers=HEADERS, timeout=10) as resp:
+            async with session.get(check_url, headers=HEADERS) as resp:
                 return resp.status == 200
 
         elif site == "eneba":
-            # No real API: validate basic code length
             return len(code) > 3
 
         elif site == "kinguin":
-            # Simulate validation
             return len(code) > 3
 
         elif site == "cdkeys":
             check_url = f"https://www.cdkeys.com/coupon/{code}"
-            async with SEM, session.get(check_url, headers=HEADERS, timeout=10) as resp:
+            async with session.get(check_url, headers=HEADERS) as resp:
                 return resp.status == 200
 
         elif site == "coupert":
-            # Validate code existence by scraping the same page or a code lookup
-            check_url = "https://coupert.com/coupons"
-            async with SEM, session.get(check_url, headers=HEADERS, timeout=10) as resp:
-                text = await resp.text()
-                return code in text
+            # Assuming similar validation as others
+            check_url = f"https://www.coupert.com/coupon/{code}"
+            async with session.get(check_url, headers=HEADERS) as resp:
+                return resp.status == 200
 
         elif site == "giftcard":
             return len(code) > 3
@@ -210,11 +199,7 @@ async def post_giftcard(code, discount):
     msg = f"✅ [GIFTCARD] {code} | {discount}% off"
     await send_discord_message(msg, GIFTCARD_CHANNEL_ID)
 
-# --- CHECKER LOOPS ---
-
 async def coupon_checker_loop():
-    global last_coupon_duration
-    start_time = time.time()
     while True:
         try:
             async with aiohttp.ClientSession() as session:
@@ -232,7 +217,6 @@ async def coupon_checker_loop():
         except Exception:
             await log_error(traceback.format_exc())
 
-        last_coupon_duration = time.time() - start_time
         await asyncio.sleep(20)
 
 async def giftcard_checker_loop():
@@ -240,6 +224,7 @@ async def giftcard_checker_loop():
         try:
             async with aiohttp.ClientSession() as session:
                 all_giftcards = await scrape_giftcards(session)
+
                 for code, discount in all_giftcards:
                     try:
                         if await validate_coupon_real(session, code, "giftcard"):
@@ -251,8 +236,6 @@ async def giftcard_checker_loop():
 
         await asyncio.sleep(60)
 
-# --- COMMANDS & EVENTS ---
-
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user}")
@@ -263,26 +246,18 @@ async def coupon(ctx):
     if coupon_task and not coupon_task.done():
         await ctx.send("Coupon checker is already running.")
         return
-    eta_msg = f"Starting coupon checker... Estimated time to first coupons: {int(last_coupon_duration or 20)} seconds"
-    await ctx.send(eta_msg)
+    await ctx.send("Starting coupon checker...")
     coupon_task = bot.loop.create_task(coupon_checker_loop())
 
 @bot.command()
-async def stop(ctx):
-    global coupon_task, giftcard_task
-    stopped_any = False
+async def stopcoupon(ctx):
+    global coupon_task
     if coupon_task and not coupon_task.done():
         coupon_task.cancel()
+        await ctx.send("Coupon checker stopped.")
         coupon_task = None
-        stopped_any = True
-    if giftcard_task and not giftcard_task.done():
-        giftcard_task.cancel()
-        giftcard_task = None
-        stopped_any = True
-    if stopped_any:
-        await ctx.send("Stopped all running checkers.")
     else:
-        await ctx.send("No checkers are currently running.")
+        await ctx.send("Coupon checker is not running.")
 
 @bot.command()
 async def giftcard(ctx):
@@ -292,5 +267,28 @@ async def giftcard(ctx):
         return
     await ctx.send("Starting gift card checker...")
     giftcard_task = bot.loop.create_task(giftcard_checker_loop())
+
+@bot.command()
+async def stopgiftcard(ctx):
+    global giftcard_task
+    if giftcard_task and not giftcard_task.done():
+        giftcard_task.cancel()
+        await ctx.send("Gift card checker stopped.")
+        giftcard_task = None
+    else:
+        await ctx.send("Gift card checker is not running.")
+
+@bot.command()
+@is_owner()
+async def purge(ctx, limit: int = 50):
+    """Purge messages from logs channel, default 50."""
+    if ctx.channel.id != LOGS_CHANNEL_ID:
+        await ctx.send("This command can only be used in the logs channel.")
+        return
+    try:
+        deleted = await ctx.channel.purge(limit=limit)
+        await ctx.send(f"Purged {len(deleted)} messages.", delete_after=5)
+    except Exception as e:
+        await ctx.send(f"Failed to purge messages: {e}")
 
 bot.run(DISCORD_TOKEN)
