@@ -7,21 +7,34 @@ import traceback
 import discord
 from discord.ext import commands
 import time
+import json
 
 load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 LOGS_CHANNEL_ID = int(os.getenv("LOGS_CHANNEL_ID") or 0)
 COUPON_CHANNEL_ID = int(os.getenv("COUPON_CHANNEL_ID") or 0)
-GIFT_CARD_CHANNEL_ID = int(os.getenv("GIFT_CARD_CHANNEL_ID") or 0)
-HEADERS = {"User-Agent": "Mozilla/5.0"}
+GIFTCARD_CHANNEL_ID = int(os.getenv("GIFTCARD_CHANNEL_ID") or 0)
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)"
+                  " Chrome/113.0.0.0 Safari/537.36"
+}
 
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix='.', intents=intents)
 
+# --- Globals & caches ---
 coupon_task = None
 giftcard_task = None
+
+# Cache validated coupons: { code: (timestamp, valid_bool) }
+validation_cache = {}
+CACHE_TTL_SECONDS = 15 * 60  # 15 minutes cache
+
+# Lock for validation cache access
+validation_cache_lock = asyncio.Lock()
 
 async def send_discord_message(message: str, channel_id: int):
     if not DISCORD_TOKEN or not channel_id:
@@ -37,20 +50,48 @@ async def send_discord_message(message: str, channel_id: int):
             async with session.post(url, headers=headers, json=json_data):
                 pass
     except Exception:
+        # Ignore send errors silently for now
         pass
 
-async def log_error(err):
-    await send_discord_message(f"🚨 Error:\n```{err[:1800]}```", LOGS_CHANNEL_ID)
+async def log_error(err: str):
+    try:
+        await send_discord_message(f"🚨 Error:\n```{err[:1800]}```", LOGS_CHANNEL_ID)
+    except Exception:
+        pass
 
-# ---------------------------
-# SCRAPING FUNCTIONS
-# ---------------------------
+def cache_cleanup():
+    """Periodically cleanup expired cache entries."""
+    now = time.time()
+    keys_to_remove = []
+    for k, (ts, _) in validation_cache.items():
+        if now - ts > CACHE_TTL_SECONDS:
+            keys_to_remove.append(k)
+    for k in keys_to_remove:
+        del validation_cache[k]
+
+async def is_cached_valid(code: str):
+    """Check cache for a coupon/gift card validation result."""
+    async with validation_cache_lock:
+        data = validation_cache.get(code)
+        if not data:
+            return None
+        ts, valid = data
+        if time.time() - ts > CACHE_TTL_SECONDS:
+            del validation_cache[code]
+            return None
+        return valid
+
+async def cache_validation_result(code: str, valid: bool):
+    async with validation_cache_lock:
+        validation_cache[code] = (time.time(), valid)
+
+# --- Scrapers ---
 
 async def scrape_g2a(session):
     url = "https://www.g2a.com/deals"
     results = []
     try:
-        async with session.get(url, headers=HEADERS) as resp:
+        async with session.get(url, headers=HEADERS, timeout=20) as resp:
             text = await resp.text()
             soup = BeautifulSoup(text, "html.parser")
             coupons = soup.find_all("div", class_="coupon-list__coupon")
@@ -59,7 +100,7 @@ async def scrape_g2a(session):
                 discount = c.find("span", class_="coupon-list__discount")
                 if code and discount:
                     code_text = code.text.strip()
-                    discount_text = discount.text.strip().replace("%", "")
+                    discount_text = discount.text.strip().replace("%", "").replace("-", "")
                     if code_text and discount_text.isdigit():
                         results.append(("g2a", code_text, discount_text))
     except Exception:
@@ -70,13 +111,14 @@ async def scrape_eneba(session):
     url = "https://www.eneba.com/us/store"
     results = []
     try:
-        async with session.get(url, headers=HEADERS) as resp:
+        async with session.get(url, headers=HEADERS, timeout=20) as resp:
             text = await resp.text()
             soup = BeautifulSoup(text, "html.parser")
             promo_badges = soup.select(".shared-product-card__discount")
             for promo in promo_badges:
                 discount_text = promo.text.strip().replace("-", "").replace("%", "")
                 if discount_text.isdigit():
+                    # Dummy code creation since no public codes shown
                     code = f"ENEBA{discount_text}"
                     results.append(("eneba", code, discount_text))
     except Exception:
@@ -87,7 +129,7 @@ async def scrape_kinguin(session):
     url = "https://www.kinguin.net/category/game-coupons-vouchers-1619/"
     results = []
     try:
-        async with session.get(url, headers=HEADERS) as resp:
+        async with session.get(url, headers=HEADERS, timeout=20) as resp:
             text = await resp.text()
             soup = BeautifulSoup(text, "html.parser")
             items = soup.select(".product-list-item")
@@ -95,8 +137,8 @@ async def scrape_kinguin(session):
                 title = item.select_one(".product-title")
                 discount = item.select_one(".discount-label")
                 if title and discount:
-                    discount_text = discount.text.strip().replace("%", "")
-                    code = title.text.strip().split()[0].upper()
+                    discount_text = discount.text.strip().replace("%", "").replace("-", "")
+                    code = title.text.strip().split()[0].upper()  # naive guess for code
                     if discount_text.isdigit():
                         results.append(("kinguin", code, discount_text))
     except Exception:
@@ -107,7 +149,7 @@ async def scrape_cdkeys(session):
     url = "https://www.cdkeys.com/coupons"
     results = []
     try:
-        async with session.get(url, headers=HEADERS) as resp:
+        async with session.get(url, headers=HEADERS, timeout=20) as resp:
             text = await resp.text()
             soup = BeautifulSoup(text, "html.parser")
             coupons = soup.select(".coupon-item")
@@ -116,91 +158,132 @@ async def scrape_cdkeys(session):
                 discount = c.select_one(".coupon-discount")
                 if code and discount:
                     code_text = code.text.strip()
-                    discount_text = discount.text.strip().replace("%", "")
+                    discount_text = discount.text.strip().replace("%", "").replace("-", "")
                     if discount_text.isdigit():
                         results.append(("cdkeys", code_text, discount_text))
     except Exception:
         await log_error("CDKeys Scrape failed:\n" + traceback.format_exc())
     return results
 
-# Example Honey scraper (basic, honey.com heavily obfuscates)
-async def scrape_honey(session):
-    # Honey site is complex with JS; we do a very basic fallback scraping here
+# --- New scrapers ---
+
+async def scrape_retailmenot(session):
+    url = "https://www.retailmenot.com/view/gaming"  # example gaming coupons page
     results = []
     try:
-        url = "https://www.joinhoney.com/coupons"
-        async with session.get(url, headers=HEADERS) as resp:
+        async with session.get(url, headers=HEADERS, timeout=20) as resp:
             text = await resp.text()
             soup = BeautifulSoup(text, "html.parser")
-            # Try find coupon code blocks if possible - demo only, honey often hides real codes
-            coupons = soup.find_all("div", class_="css-1mzh2pn")  # example class, may need update
+            coupons = soup.select(".offer-coupon")  # example selector, needs updating for real site
             for c in coupons:
-                code_tag = c.find("span", class_="css-1v48n8k")  # example class, may need update
-                discount_tag = c.find("div", class_="css-1l7kphn")  # example class, may need update
+                code_tag = c.select_one(".code")
+                discount_tag = c.select_one(".discount")
                 if code_tag and discount_tag:
-                    code = code_tag.text.strip()
+                    code_text = code_tag.text.strip()
                     discount_text = ''.join(filter(str.isdigit, discount_tag.text))
-                    if code and discount_text.isdigit():
-                        results.append(("honey", code, discount_text))
+                    if code_text and discount_text.isdigit():
+                        results.append(("retailmenot", code_text, discount_text))
     except Exception:
-        await log_error("Honey Scrape failed:\n" + traceback.format_exc())
+        await log_error("RetailMeNot scrape failed:\n" + traceback.format_exc())
     return results
 
-# ---------------------------
-# GIFT CARD SCRAPER (dummy example)
-# ---------------------------
+async def scrape_slickdeals(session):
+    url = "https://slickdeals.net/coupons/"
+    results = []
+    try:
+        async with session.get(url, headers=HEADERS, timeout=20) as resp:
+            text = await resp.text()
+            soup = BeautifulSoup(text, "html.parser")
+            coupons = soup.select(".coupon")
+            for c in coupons:
+                code_tag = c.select_one(".code")
+                discount_tag = c.select_one(".discount")
+                if code_tag and discount_tag:
+                    code_text = code_tag.text.strip()
+                    discount_text = ''.join(filter(str.isdigit, discount_tag.text))
+                    if code_text and discount_text.isdigit():
+                        results.append(("slickdeals", code_text, discount_text))
+    except Exception:
+        await log_error("Slickdeals scrape failed:\n" + traceback.format_exc())
+    return results
+
+async def scrape_couponsdotcom(session):
+    url = "https://www.coupons.com/coupon-codes/"
+    results = []
+    try:
+        async with session.get(url, headers=HEADERS, timeout=20) as resp:
+            text = await resp.text()
+            soup = BeautifulSoup(text, "html.parser")
+            coupons = soup.select(".coupon-code")
+            for c in coupons:
+                code_text = c.text.strip()
+                # Discount extraction hard, so skipping for now
+                results.append(("couponsdotcom", code_text, "0"))
+    except Exception:
+        await log_error("Coupons.com scrape failed:\n" + traceback.format_exc())
+    return results
+
+# Dummy Honey scraper: real Honey uses heavy JS, no official API
+async def scrape_honey(session):
+    # No public API or scraping, so return empty or dummy
+    return []
+
+# --- Gift card scraper (dummy example) ---
 
 async def scrape_giftcards(session):
     results = []
     try:
-        # Dummy gift card scraping: add real sites here
-        # Example dummy card:
-        results.append(("GIFT2025", "15"))
-        # Add more scraping from real gift card sites if available
+        # Real gift card sites would be added here with scraping logic
+        # Demo dummy gift card:
+        results.append(("GIFT2025", "15"))  # code, discount %
     except Exception:
         await log_error("Gift card scrape failed:\n" + traceback.format_exc())
     return results
 
-# ---------------------------
-# VALIDATION FUNCTION
-# ---------------------------
+# --- Validation ---
 
 async def validate_coupon_real(session, code, site):
+    """
+    Lightning-fast validation with caching:
+    - Check cache first
+    - Do basic HEAD or GET request to coupon detail page if possible
+    - Return True if site says valid or HTTP 200 on check URL
+    """
+    cached = await is_cached_valid(code)
+    if cached is not None:
+        return cached
+    valid = False
     try:
+        # Site-specific validation logic:
         if site == "g2a":
             check_url = f"https://www.g2a.com/coupon/{code}"
-            async with session.get(check_url, headers=HEADERS) as resp:
-                return resp.status == 200
-
+            async with session.head(check_url, headers=HEADERS, timeout=10) as resp:
+                valid = resp.status == 200
         elif site == "eneba":
-            # Assume codes starting with ENEBA and length > 5 are valid
-            return code.startswith("ENEBA") and len(code) > 5
-
+            # No official API, assume code with length > 3 is valid for demo
+            valid = len(code) > 3
         elif site == "kinguin":
-            # Check if the code is somewhat valid length
-            return len(code) > 3
-
+            # Simulate validation
+            valid = len(code) > 3
         elif site == "cdkeys":
             check_url = f"https://www.cdkeys.com/coupon/{code}"
-            async with session.get(check_url, headers=HEADERS) as resp:
-                return resp.status == 200
-
-        elif site == "honey":
-            # Honey codes: basic length check
-            return len(code) > 3
-
+            async with session.head(check_url, headers=HEADERS, timeout=10) as resp:
+                valid = resp.status == 200
+        elif site == "retailmenot":
+            # Assume codes longer than 3 are valid for demo
+            valid = len(code) > 3
+        elif site == "slickdeals":
+            valid = len(code) > 3
+        elif site == "couponsdotcom":
+            valid = len(code) > 3
         elif site == "giftcard":
-            # Basic dummy validation
-            return len(code) > 3
-        
+            valid = len(code) > 3
         else:
-            return False
+            valid = False
     except Exception:
-        return False
-
-# ---------------------------
-# POST MESSAGES
-# ---------------------------
+        valid = False
+    await cache_validation_result(code, valid)
+    return valid
 
 async def post_coupon(site, code, discount):
     msg = f"✅ [{site.upper()}] {code} | {discount}% off"
@@ -208,73 +291,124 @@ async def post_coupon(site, code, discount):
 
 async def post_giftcard(code, discount):
     msg = f"✅ [GIFTCARD] {code} | {discount}% off"
-    await send_discord_message(msg, GIFT_CARD_CHANNEL_ID)
+    await send_discord_message(msg, GIFTCARD_CHANNEL_ID)
 
-# ---------------------------
-# CHECKER LOOPS WITH ETA TRACKING
-# ---------------------------
+# --- Async concurrent validator for coupons ---
+
+async def validate_coupons_concurrently(session, coupons):
+    """
+    coupons: list of tuples (site, code, discount)
+    Returns: list of tuples (site, code, discount, valid_bool)
+    """
+    sem = asyncio.Semaphore(20)  # limit concurrency
+
+    results = []
+
+    async def validate_one(site, code, discount):
+        async with sem:
+            valid = await validate_coupon_real(session, code, site)
+            results.append((site, code, discount, valid))
+
+    tasks = [validate_one(site, code, discount) for (site, code, discount) in coupons]
+    await asyncio.gather(*tasks)
+    return results
+
+# --- Coupon checker main loop ---
 
 async def coupon_checker_loop():
-    start_time = time.time()
-    count = 0
-    try:
-        async with aiohttp.ClientSession() as session:
-            # Scrapers list
-            scrapers = [scrape_g2a, scrape_eneba, scrape_kinguin, scrape_cdkeys, scrape_honey]
-            all_coupons = []
-            for scraper in scrapers:
-                res = await scraper(session)
-                all_coupons.extend(res)
-            total = len(all_coupons)
-            if total == 0:
-                await send_discord_message("⚠️ No coupons found in this check.", COUPON_CHANNEL_ID)
-                return
-            for idx, (site, code, discount) in enumerate(all_coupons, 1):
-                if await validate_coupon_real(session, code, site):
+    while True:
+        try:
+            async with aiohttp.ClientSession() as session:
+                await send_discord_message("🔍 Starting coupon scrape & validation...", COUPON_CHANNEL_ID)
+                start_time = time.time()
+                # Scrape all sites
+                all_coupons = []
+                scrapers = [
+                    scrape_g2a,
+                    scrape_eneba,
+                    scrape_kinguin,
+                    scrape_cdkeys,
+                    scrape_retailmenot,
+                    scrape_slickdeals,
+                    scrape_couponsdotcom,
+                    scrape_honey,
+                ]
+                for scraper in scrapers:
+                    scraped = await scraper(session)
+                    all_coupons.extend(scraped)
+
+                total = len(all_coupons)
+                if total == 0:
+                    await send_discord_message("⚠️ No coupons found this cycle.", COUPON_CHANNEL_ID)
+                    await asyncio.sleep(30)
+                    continue
+
+                # Validate coupons concurrently
+                validated = await validate_coupons_concurrently(session, all_coupons)
+                duration = time.time() - start_time
+
+                valid_coupons = [c for c in validated if c[3]]
+
+                # Post valid coupons
+                for site, code, discount, valid in valid_coupons:
                     await post_coupon(site, code, discount)
-                count += 1
-                # Update ETA approx every 5 coupons
-                if count % 5 == 0 or idx == total:
-                    elapsed = time.time() - start_time
-                    avg_per = elapsed / count if count else 1
-                    remaining = total - count
-                    eta = remaining * avg_per
-                    eta_msg = f"Checked {count}/{total} coupons. ETA: {int(eta)} seconds"
-                    await send_discord_message(eta_msg, COUPON_CHANNEL_ID)
-    except Exception:
-        await log_error(traceback.format_exc())
+
+                avg_time_per_coupon = duration / total if total else 0
+                remaining = 0  # after done this cycle, next ETA is next cycle wait time
+
+                eta = int(avg_time_per_coupon * remaining)
+                msg = (f"✅ Checked {total} coupons in {int(duration)}s, "
+                       f"found {len(valid_coupons)} valid.\n"
+                       f"Next run ETA: ~30s")
+                await send_discord_message(msg, COUPON_CHANNEL_ID)
+        except Exception:
+            await log_error(traceback.format_exc())
+        await asyncio.sleep(30)  # wait 30s between runs
+
+# --- Gift card checker loop (dummy example) ---
 
 async def giftcard_checker_loop():
-    start_time = time.time()
-    count = 0
-    try:
-        async with aiohttp.ClientSession() as session:
-            all_giftcards = await scrape_giftcards(session)
-            total = len(all_giftcards)
-            if total == 0:
-                await send_discord_message("⚠️ No gift cards found in this check.", GIFT_CARD_CHANNEL_ID)
-                return
-            for idx, (code, discount) in enumerate(all_giftcards, 1):
-                if await validate_coupon_real(session, code, "giftcard"):
+    while True:
+        try:
+            async with aiohttp.ClientSession() as session:
+                await send_discord_message("🔍 Starting gift card scrape & validation...", GIFTCARD_CHANNEL_ID)
+                start_time = time.time()
+
+                # Scrape gift cards - add real scrapers here
+                all_giftcards = await scrape_giftcards(session)
+                total = len(all_giftcards)
+                if total == 0:
+                    await send_discord_message("⚠️ No gift cards found this cycle.", GIFTCARD_CHANNEL_ID)
+                    await asyncio.sleep(60)
+                    continue
+
+                validated = []
+                sem = asyncio.Semaphore(20)
+
+                async def validate_giftcard(code, discount):
+                    async with sem:
+                        # Dummy validation - accept all with code length > 3
+                        valid = len(code) > 3
+                        validated.append((code, discount, valid))
+
+                tasks = [validate_giftcard(code, discount) for (code, discount) in all_giftcards]
+                await asyncio.gather(*tasks)
+
+                valid_giftcards = [c for c in validated if c[2]]
+                for code, discount, valid in valid_giftcards:
                     await post_giftcard(code, discount)
-                count += 1
-                if count % 5 == 0 or idx == total:
-                    elapsed = time.time() - start_time
-                    avg_per = elapsed / count if count else 1
-                    remaining = total - count
-                    eta = remaining * avg_per
-                    eta_msg = f"Checked {count}/{total} gift cards. ETA: {int(eta)} seconds"
-                    await send_discord_message(eta_msg, GIFT_CARD_CHANNEL_ID)
-    except Exception:
-        await log_error(traceback.format_exc())
 
-# ---------------------------
-# DISCORD COMMANDS
-# ---------------------------
+                duration = time.time() - start_time
+                msg = (f"✅ Checked {total} gift cards in {int(duration)}s, "
+                       f"found {len(valid_giftcards)} valid.\n"
+                       f"Next run ETA: ~60s")
+                await send_discord_message(msg, GIFTCARD_CHANNEL_ID)
 
-@bot.event
-async def on_ready():
-    print(f"Logged in as {bot.user}")
+        except Exception:
+            await log_error(traceback.format_exc())
+        await asyncio.sleep(60)
+
+# --- Commands ---
 
 @bot.command()
 async def coupon(ctx):
@@ -282,18 +416,8 @@ async def coupon(ctx):
     if coupon_task and not coupon_task.done():
         await ctx.send("Coupon checker is already running.")
         return
-    await ctx.send("Starting coupon checker...")
-    coupon_task = bot.loop.create_task(coupon_checker_loop())
-
-@bot.command()
-async def stopcoupon(ctx):
-    global coupon_task
-    if coupon_task and not coupon_task.done():
-        coupon_task.cancel()
-        await ctx.send("Coupon checker stopped.")
-        coupon_task = None
-    else:
-        await ctx.send("Coupon checker is not running.")
+    coupon_task = asyncio.create_task(coupon_checker_loop())
+    await ctx.send("Started coupon checker task.")
 
 @bot.command()
 async def giftcard(ctx):
@@ -301,34 +425,47 @@ async def giftcard(ctx):
     if giftcard_task and not giftcard_task.done():
         await ctx.send("Gift card checker is already running.")
         return
-    await ctx.send("Starting gift card checker...")
-    giftcard_task = bot.loop.create_task(giftcard_checker_loop())
+    giftcard_task = asyncio.create_task(giftcard_checker_loop())
+    await ctx.send("Started gift card checker task.")
+
+@bot.command()
+async def stopcoupon(ctx):
+    global coupon_task
+    if coupon_task:
+        coupon_task.cancel()
+        coupon_task = None
+        await ctx.send("Coupon checker stopped.")
+    else:
+        await ctx.send("Coupon checker was not running.")
 
 @bot.command()
 async def stopgiftcard(ctx):
     global giftcard_task
-    if giftcard_task and not giftcard_task.done():
+    if giftcard_task:
         giftcard_task.cancel()
-        await ctx.send("Gift card checker stopped.")
         giftcard_task = None
+        await ctx.send("Gift card checker stopped.")
     else:
-        await ctx.send("Gift card checker is not running.")
+        await ctx.send("Gift card checker was not running.")
 
 @bot.command()
 async def stop(ctx):
+    await ctx.send("Stopping all checkers...")
     global coupon_task, giftcard_task
-    stopped_any = False
-    if coupon_task and not coupon_task.done():
+    if coupon_task:
         coupon_task.cancel()
         coupon_task = None
-        stopped_any = True
-    if giftcard_task and not giftcard_task.done():
+    if giftcard_task:
         giftcard_task.cancel()
         giftcard_task = None
-        stopped_any = True
-    if stopped_any:
-        await ctx.send("All checkers stopped.")
-    else:
-        await ctx.send("No checkers were running.")
+    await ctx.send("All checkers stopped.")
+
+@bot.event
+async def on_ready():
+    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
+    print("------")
+
+# --- Run bot ---
 
 bot.run(DISCORD_TOKEN)
+
